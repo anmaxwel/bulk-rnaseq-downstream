@@ -1,0 +1,489 @@
+# ============================================================
+# 03_networks_brain_timepoints.R
+# Brain E12.5 vs E17.5 GO term–gene networks per sex + overlap
+# Robust to duplicate/NA vertex names and duplicate edges
+# ============================================================
+
+# ---------- 0) Packages ----------
+safe_install <- function(pkgs){
+  to_get <- pkgs[!(pkgs %in% rownames(installed.packages()))]
+  if (length(to_get)) install.packages(to_get, dependencies = TRUE)
+}
+safe_bioc_install <- function(pkgs){
+  to_get <- pkgs[!(pkgs %in% rownames(installed.packages()))]
+  if (length(to_get)) BiocManager::install(to_get, ask = FALSE, update = FALSE)
+}
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+# For GitHub: do not auto-install unless you explicitly enable it
+# Set env var: RNASEQ_TOOLKIT_INSTALL_DEPS=true
+do_install <- identical(tolower(Sys.getenv("RNASEQ_TOOLKIT_INSTALL_DEPS")), "true")
+
+cran_pkgs <- c("data.table","dplyr","stringr","igraph","ggraph","ggplot2","scales","ggrepel","readr")
+bioc_pkgs <- c("GO.db","AnnotationDbi")
+
+if (do_install) {
+  safe_install(cran_pkgs)
+  safe_bioc_install(bioc_pkgs)
+} else {
+  missing_cran <- cran_pkgs[!vapply(cran_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+  missing_bioc <- bioc_pkgs[!vapply(bioc_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing_cran) || length(missing_bioc)) {
+    stop(
+      "Missing packages:\n",
+      if (length(missing_cran)) paste0("CRAN: ", paste(missing_cran, collapse = ", "), "\n") else "",
+      if (length(missing_bioc)) paste0("Bioc: ", paste(missing_bioc, collapse = ", "), "\n") else "",
+      "Install them (or set RNASEQ_TOOLKIT_INSTALL_DEPS=true)."
+    )
+  }
+}
+
+suppressPackageStartupMessages({
+  library(data.table); library(dplyr); library(stringr)
+  library(igraph);     library(ggraph); library(ggplot2)
+  library(scales);     library(ggrepel); library(readr)
+  library(GO.db);      library(AnnotationDbi)
+})
+
+`%||%` <- function(a,b) if(!is.null(a)) a else b
+
+# ---------- 1) Config ----------
+# OPTIONAL: allow base_dir override from command line or env var
+# Usage:
+#   Rscript scripts/03_networks_brain_timepoints.R "path/to/project_dir"
+args <- commandArgs(trailingOnly = TRUE)
+base_dir_default <- "C:/Users/antho/OneDrive - Wayne State University/Wayne/Mor Lab/Projects/Fetal Immune System Project/Experiments/17. Benzene Brain/1 - Benzene Brain Initial Analysis"
+base_dir <- if (length(args) >= 1) args[1] else Sys.getenv("RNASEQ_BASE_DIR", unset = base_dir_default)
+
+DEG_FILES <- list(
+  Female = c(
+    Female_E12 = file.path(base_dir, "E12.5_Benzene_Brain_Female.csv"),
+    Female_E17 = file.path(base_dir, "E17.5_Benzene_Brain_Female.csv")
+  ),
+  Male   = c(
+    Male_E12   = file.path(base_dir, "E12.5_Benzene_Brain_Male.csv"),
+    Male_E17   = file.path(base_dir, "E17.5_Benzene_Brain_Male.csv")
+  )
+)
+
+GO_DIR  <- file.path(base_dir, "GO_BP_Results_Brain")
+OUTDIR  <- file.path(base_dir, "Networks_Brain")
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+
+# Network tuning
+TOP_TERMS       <- 15
+DEDUP_TERMS     <- TRUE
+JACCARD_THRESH  <- 0.6
+MIN_GENE_DEGREE <- 1
+LABEL_SIG_ONLY  <- TRUE
+
+# NEW: optionally restrict GO terms to significant only (set to 1 to disable)
+GO_TERM_FDR_CUT <- 0.05
+
+# OPTIONAL: extra simplified network for Male E17.5 (set NULL to disable)
+MALE_E17_MAX_GENES_PER_TERM <- NULL  # e.g., 5
+
+# ---------- 2) Immune expansion ----------
+get_immune_expanded_ids <- function(){
+  roots <- c(
+    "GO:0002376", # immune system process
+    "GO:0006954", # inflammatory response
+    "GO:0006952", # defense response
+    "GO:0006955", # immune response
+    "GO:0045087", # innate immune response
+    "GO:0002682"  # regulation of immune system process
+  )
+  lst <- AnnotationDbi::as.list(GO.db::GOBPOFFSPRING)
+  kids <- unique(unlist(lst[roots], use.names = FALSE))
+  unique(c(roots, kids))
+}
+
+is_immune_like <- function(desc_vec){
+  grepl("(immune|inflamm|defense|cytokin|chemokin|leukocyt|macroph|neutroph|complement|antigen)",
+        desc_vec, ignore.case = TRUE)
+}
+
+IMMUNE_IDS <- get_immune_expanded_ids()
+
+# ---------- 3) IO helpers ----------
+read_deg <- function(path){
+  if (!file.exists(path)) stop("Missing DEG file: ", path)
+  dt <- data.table::fread(path, showProgress = FALSE)
+  names(dt) <- tolower(names(dt))
+
+  # NOTE: entrez is optional for this script
+  need <- c("symbol","logfc","adjpv")
+  miss <- setdiff(need, names(dt))
+  if (length(miss)) stop("Missing cols in ", path, ": ", paste(miss, collapse=", "))
+
+  dt[, symbol := as.character(symbol)]
+  dt[, logfc  := suppressWarnings(as.numeric(logfc))]
+  dt[, adjpv  := suppressWarnings(as.numeric(adjpv))]
+  dt <- unique(dt, by = "symbol")
+  dt[]
+}
+
+union_deg_two_timepoints <- function(pths){
+  stopifnot(length(pths) == 2)
+  d1 <- read_deg(pths[[1]])
+  d2 <- read_deg(pths[[2]])
+  all <- data.table::rbindlist(list(d1, d2), use.names = TRUE, fill = TRUE)
+
+  all[, .(
+    logfc = {
+      v <- logfc
+      v[is.na(v)] <- 0
+      v[which.max(abs(v))]
+    },
+    adjpv = {
+      v <- adjpv
+      if (all(is.na(v))) NA_real_ else suppressWarnings(min(v, na.rm = TRUE))
+    }
+  ), by = symbol][order(symbol)]
+}
+
+read_go_all_label <- function(label){
+  fp_all <- file.path(GO_DIR, paste0("ORA_BP_", label, "_ALL.csv"))
+  fp_imm <- file.path(GO_DIR, paste0("ORA_BP_", label, "_IMMUNE.csv"))
+
+  if (file.exists(fp_all)) {
+    eg <- suppressWarnings(data.table::fread(fp_all, showProgress = FALSE))
+  } else if (file.exists(fp_imm)) {
+    message("Using IMMUNE CSV for ", label, " because ALL CSV not found.")
+    eg <- suppressWarnings(data.table::fread(fp_imm, showProgress = FALSE))
+  } else {
+    return(NULL)
+  }
+
+  if (!nrow(eg)) return(NULL)
+
+  need <- c("ID","Description","p.adjust","geneID","Count")
+  miss <- setdiff(need, names(eg))
+  if (length(miss)) stop("Missing GO cols in ", label, ": ", paste(miss, collapse=", "))
+
+  eg$p.adjust <- suppressWarnings(as.numeric(eg$p.adjust))
+
+  # NEW: optional significance filter on GO terms
+  if (!is.null(GO_TERM_FDR_CUT) && !is.na(GO_TERM_FDR_CUT) && GO_TERM_FDR_CUT < 1) {
+    eg <- eg[!is.na(p.adjust) & p.adjust <= GO_TERM_FDR_CUT]
+    if (!nrow(eg)) return(NULL)
+  }
+
+  as.data.frame(eg)
+}
+
+filter_expanded_immune <- function(go_df){
+  if (is.null(go_df) || !nrow(go_df)) return(go_df)
+  keep <- (go_df$ID %in% IMMUNE_IDS) | is_immune_like(go_df$Description)
+  go_df[keep, , drop = FALSE]
+}
+
+# ---------- 4) Build term–gene edges with hardening ----------
+parse_edges <- function(go_df, top_terms = 15){
+  if (is.null(go_df) || !nrow(go_df)) return(data.frame(term_id=character(), gene=character()))
+
+  go_df <- go_df[order(go_df$p.adjust, -go_df$Count), , drop = FALSE]
+  go_df <- head(go_df, min(nrow(go_df), max(top_terms * 2, top_terms)))
+
+  sets <- lapply(strsplit(go_df$geneID, "/", fixed = TRUE), function(x) {
+    x <- unique(trimws(as.character(x)))
+    x[!is.na(x) & nzchar(x)]
+  })
+  names(sets) <- go_df$ID
+
+  keep_ids <- character(0)
+  for (i in seq_along(sets)){
+    id <- names(sets)[i]
+    if (!DEDUP_TERMS || length(keep_ids) == 0) { keep_ids <- c(keep_ids, id); next }
+    jac <- sapply(keep_ids, function(k){
+      inter <- length(intersect(sets[[id]], sets[[k]]))
+      un    <- length(union(sets[[id]], sets[[k]]))
+      if (un == 0) 0 else inter/un
+    })
+    if (max(jac, na.rm = TRUE) < JACCARD_THRESH) keep_ids <- c(keep_ids, id)
+  }
+
+  go_df <- go_df[go_df$ID %in% keep_ids, , drop = FALSE]
+  go_df <- head(go_df, min(nrow(go_df), top_terms))
+
+  edges <- lapply(seq_len(nrow(go_df)), function(i){
+    genes <- unlist(strsplit(go_df$geneID[i], "/", fixed = TRUE))
+    genes <- unique(trimws(as.character(genes)))
+    genes <- genes[!is.na(genes) & nzchar(genes)]
+    if (!length(genes)) return(NULL)
+    data.frame(term_id   = as.character(go_df$ID[i]),
+               term_desc = as.character(go_df$Description[i]),
+               term_padj = as.numeric(go_df$p.adjust[i]),
+               gene      = genes,
+               stringsAsFactors = FALSE)
+  })
+  edges <- Filter(Negate(is.null), edges)
+  if (!length(edges)) return(data.frame(term_id=character(), gene=character()))
+  edges <- do.call(rbind, edges)
+
+  edges <- edges %>%
+    dplyr::mutate(term_id = as.character(term_id),
+                  gene    = as.character(gene)) %>%
+    dplyr::filter(!is.na(term_id), !is.na(gene), nzchar(term_id), nzchar(gene)) %>%
+    dplyr::distinct(term_id, gene, .keep_all = TRUE)
+
+  edges
+}
+
+# ---------- 5) Graph and plotting with de-duplicated vertices ----------
+build_bipartite_graph <- function(edges, deg_dt){
+  if (is.null(edges) || !nrow(edges)) return(igraph::make_empty_graph())
+
+  term_nodes <- edges %>%
+    dplyr::select(term = term_id, term_desc, term_padj) %>%
+    dplyr::group_by(term) %>%
+    dplyr::summarise(
+      term_desc = dplyr::first(term_desc[!is.na(term_desc) & nzchar(term_desc)] %||% term),
+      term_padj = { v <- term_padj; if (all(is.na(v))) NA_real_ else suppressWarnings(min(v, na.rm = TRUE)) },
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      name = term, type = "term",
+      neglog10padj = -log10(pmax(term_padj, .Machine$double.xmin))
+    )
+
+  gene_nodes_raw <- edges %>%
+    dplyr::select(gene) %>% dplyr::distinct() %>%
+    dplyr::mutate(gene_uc = toupper(gene)) %>%
+    dplyr::left_join(
+      deg_dt %>%
+        dplyr::mutate(gene_uc = toupper(symbol)) %>%
+        dplyr::select(gene_uc, symbol, logfc, adjpv),
+      by = "gene_uc"
+    ) %>%
+    dplyr::mutate(name = gene, disp_name = dplyr::coalesce(symbol, gene))
+
+  gene_nodes <- gene_nodes_raw %>%
+    dplyr::group_by(name) %>%
+    dplyr::summarise(
+      disp_name = dplyr::first(disp_name[!is.na(disp_name) & nzchar(disp_name)] %||% name),
+      logfc     = { v <- logfc; v[is.na(v)] <- 0; if (length(v)) v[which.max(abs(v))] else NA_real_ },
+      adjpv     = { v <- adjpv; if (all(is.na(v))) NA_real_ else suppressWarnings(min(v, na.rm = TRUE)) },
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(type = "gene")
+
+  nodes <- dplyr::bind_rows(
+    term_nodes %>% dplyr::select(name, type, neglog10padj, term_desc),
+    gene_nodes %>% dplyr::select(name, type, logfc, adjpv, disp_name)
+  ) %>%
+    dplyr::filter(!is.na(name), nzchar(name)) %>%
+    dplyr::distinct(name, .keep_all = TRUE)
+
+  igraph::graph_from_data_frame(
+    d = data.frame(from = edges$term_id, to = edges$gene, stringsAsFactors = FALSE),
+    vertices = nodes,
+    directed = FALSE
+  )
+}
+
+safe_rescale <- function(x, to = c(1, 10)){
+  if (all(is.na(x))) return(rep(mean(to), length(x)))
+  rng <- range(x, na.rm = TRUE)
+  if (!is.finite(rng[1]) || !is.finite(rng[2]) || rng[1] == rng[2]) return(rep(mean(to), length(x)))
+  scales::rescale(x, to = to, from = rng)
+}
+
+plot_bipartite <- function(g, title_text, out_png){
+  if (igraph::vcount(g) == 0 || igraph::gsize(g) == 0) {
+    message("Empty network: ", out_png); return(invisible(NULL))
+  }
+
+  if (!is.null(MIN_GENE_DEGREE) && MIN_GENE_DEGREE > 1){
+    repeat {
+      degv <- igraph::degree(g)
+      drop <- igraph::V(g)[(type == "gene") & (degv < MIN_GENE_DEGREE)]
+      if (length(drop) == 0) break
+      g <- igraph::delete_vertices(g, drop)
+    }
+    g <- igraph::delete_vertices(g, igraph::V(g)[igraph::degree(g) == 0])
+  }
+  if (igraph::vcount(g) == 0 || igraph::gsize(g) == 0) {
+    message("Network empty after pruning: ", out_png); return(invisible(NULL))
+  }
+
+  is_term <- igraph::V(g)$type == "term"
+  term_score <- igraph::V(g)$neglog10padj; term_score[!is_term] <- NA_real_
+  gene_absfc <- abs(igraph::V(g)$logfc);   gene_absfc[is_term]  <- NA_real_
+
+  igraph::V(g)$size <- ifelse(
+    is_term,
+    safe_rescale(term_score, to = c(6, 18)),
+    safe_rescale(gene_absfc,  to = c(3, 12))
+  )
+
+  lfc <- igraph::V(g)$logfc; lfc[is.na(lfc)] <- 0
+  maxabs <- max(1e-6, max(abs(lfc), na.rm = TRUE))
+  gene_fill <- scales::col_numeric(c("blue","grey90","red"), domain=c(-maxabs, maxabs))(lfc)
+
+  tscore <- igraph::V(g)$neglog10padj; tscore[is.na(tscore)] <- 0
+  term_fill <- scales::col_numeric(c("#e5eefb","#1446a0"), domain=range(tscore, na.rm=TRUE))(tscore)
+
+  igraph::V(g)$fill <- ifelse(is_term, term_fill, gene_fill)
+
+  gene_label_ok <- if (LABEL_SIG_ONLY) (!is.na(igraph::V(g)$adjpv) & igraph::V(g)$adjpv < 0.05) else TRUE
+  igraph::V(g)$label <- ifelse(
+    is_term,
+    stringr::str_wrap(igraph::V(g)$term_desc %||% igraph::V(g)$name, 35),
+    ifelse(gene_label_ok, igraph::V(g)$disp_name %||% igraph::V(g)$name, "")
+  )
+
+  set.seed(42)
+  lay <- ggraph::create_layout(g, layout = "fr")
+  lab <- igraph::vertex_attr(g, "label"); if (is.null(lab)) lab <- igraph::V(g)$name
+  lay$label <- as.character(lab)
+  lay$type  <- as.character(igraph::vertex_attr(g, "type"))
+  lay$size  <- igraph::V(g)$size
+  lay$fill  <- igraph::V(g)$fill
+
+  p <- ggplot(lay) +
+    ggraph::geom_edge_link(alpha = 0.25) +
+    ggplot2::geom_point(
+      data = subset(lay, type == "term"),
+      aes(x = x, y = y),
+      size = subset(lay, type == "term")$size,
+      fill = subset(lay, type == "term")$fill,
+      shape = 22, stroke = 0.3, color = "grey20"
+    ) +
+    ggplot2::geom_point(
+      data = subset(lay, type == "gene"),
+      aes(x = x, y = y),
+      size = subset(lay, type == "gene")$size,
+      fill = subset(lay, type == "gene")$fill,
+      shape = 21, stroke = 0.3, color = "grey20"
+    ) +
+    ggrepel::geom_text_repel(
+      data = subset(lay, nzchar(label)),
+      aes(x = x, y = y, label = label),
+      size = 3, box.padding = 0.3, point.padding = 0.2, max.overlaps = Inf
+    ) +
+    guides(size = "none", fill = "none") +
+    labs(
+      title = title_text,
+      subtitle = "Squares = GO terms (size -log10 FDR). Circles = genes (size |logFC|)."
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"),
+          axis.title = element_blank(), axis.text = element_blank(), panel.grid = element_blank())
+
+  ggsave(out_png, p, width = 13, height = 8.5, dpi = 300)
+  invisible(NULL)
+}
+
+graph_hubs_table <- function(g){
+  if (igraph::vcount(g) == 0) return(data.frame())
+  igraph::V(g)$degree <- igraph::degree(g, mode = "all")
+  igraph::V(g)$btw    <- igraph::betweenness(g, directed = FALSE, normalized = TRUE)
+  data.frame(
+    node = igraph::V(g)$name, type = igraph::V(g)$type,
+    degree = igraph::V(g)$degree, betweenness = igraph::V(g)$btw,
+    logfc = if ("logfc" %in% igraph::vertex_attr_names(g)) igraph::V(g)$logfc else NA_real_,
+    adjpv = if ("adjpv" %in% igraph::vertex_attr_names(g)) igraph::V(g)$adjpv else NA_real_,
+    term_desc = if ("term_desc" %in% igraph::vertex_attr_names(g)) igraph::V(g)$term_desc else NA_character_,
+    neglog10padj = if ("neglog10padj" %in% igraph::vertex_attr_names(g)) igraph::V(g)$neglog10padj else NA_real_,
+    stringsAsFactors = FALSE
+  )
+}
+
+# ---------- Optional helper: limit genes per GO term ----------
+limit_genes_per_term <- function(edges, deg_df, max_genes = 5){
+  stopifnot(is.data.frame(edges), is.data.frame(deg_df))
+  edges %>%
+    dplyr::mutate(gene_uc = toupper(gene)) %>%
+    dplyr::left_join(
+      deg_df %>%
+        dplyr::mutate(gene_uc = toupper(symbol)) %>%
+        dplyr::select(gene_uc, logfc, adjpv),
+      by = "gene_uc"
+    ) %>%
+    dplyr::distinct(term_id, gene, .keep_all = TRUE) %>%
+    dplyr::group_by(term_id) %>%
+    dplyr::arrange(dplyr::desc(!is.na(logfc)), dplyr::desc(abs(logfc)), .by_group = TRUE) %>%
+    dplyr::mutate(.rk = dplyr::row_number()) %>%
+    dplyr::ungroup() %>%
+    dplyr::filter(.rk <= max_genes) %>%
+    dplyr::select(term_id, term_desc, term_padj, gene)
+}
+
+# ---------- 6) Run per sex: E12.5, E17.5, Overlap ----------
+for (sex in names(DEG_FILES)){
+  message("\n[", sex, "] building timepoint and overlap networks...")
+
+  labels <- if (sex == "Female") c("Female_E12","Female_E17") else c("Male_E12","Male_E17")
+
+  # DEG
+  deg_e12   <- read_deg(DEG_FILES[[sex]][[1]])
+  deg_e17   <- read_deg(DEG_FILES[[sex]][[2]])
+  deg_union <- union_deg_two_timepoints(DEG_FILES[[sex]])
+
+  # GO per timepoint and expanded-immune filter
+  go_e12 <- filter_expanded_immune(read_go_all_label(labels[1]))
+  go_e17 <- filter_expanded_immune(read_go_all_label(labels[2]))
+
+  if (is.null(go_e12) || !nrow(go_e12)) { message("[", sex, "] no E12.5 immune-like GO."); next }
+  if (is.null(go_e17) || !nrow(go_e17)) { message("[", sex, "] no E17.5 immune-like GO."); next }
+
+  # Edges per timepoint
+  edges_e12 <- parse_edges(go_e12, TOP_TERMS)
+  edges_e17 <- parse_edges(go_e17, TOP_TERMS)
+
+  # E12.5 network
+  g_e12 <- build_bipartite_graph(edges_e12, deg_e12)
+  out_png_e12 <- file.path(OUTDIR, paste0(sex, "_E12.5_GO_network.png"))
+  plot_bipartite(g_e12, paste0(sex, " immune-expanded GO–gene network (E12.5)"), out_png_e12)
+  hubs_e12 <- graph_hubs_table(g_e12)
+  data.table::fwrite(hubs_e12[order(-hubs_e12$degree, -hubs_e12$betweenness), ],
+                     file.path(OUTDIR, paste0(sex, "_E12.5_GO_network_hubs.csv")))
+
+  # E17.5 network
+  g_e17 <- build_bipartite_graph(edges_e17, deg_e17)
+  out_png_e17 <- file.path(OUTDIR, paste0(sex, "_E17.5_GO_network.png"))
+  plot_bipartite(g_e17, paste0(sex, " immune-expanded GO–gene network (E17.5)"), out_png_e17)
+  hubs_e17 <- graph_hubs_table(g_e17)
+  data.table::fwrite(hubs_e17[order(-hubs_e17$degree, -hubs_e17$betweenness), ],
+                     file.path(OUTDIR, paste0(sex, "_E17.5_GO_network_hubs.csv")))
+
+  # Optional: Male E17.5 simplified (max genes per term)
+  if (sex == "Male" && !is.null(MALE_E17_MAX_GENES_PER_TERM) && is.finite(MALE_E17_MAX_GENES_PER_TERM)) {
+    edges_e17_top <- limit_genes_per_term(edges_e17, deg_e17, max_genes = MALE_E17_MAX_GENES_PER_TERM)
+    g_e17_top     <- build_bipartite_graph(edges_e17_top, deg_e17)
+
+    out_png_e17_top <- file.path(OUTDIR, paste0("Male_E17.5_GO_network_top", MALE_E17_MAX_GENES_PER_TERM, "perTerm.png"))
+    plot_bipartite(
+      g_e17_top,
+      paste0("Male immune-expanded GO–gene network (E17.5, max ", MALE_E17_MAX_GENES_PER_TERM, " genes per term)"),
+      out_png_e17_top
+    )
+
+    hubs_e17_top <- graph_hubs_table(g_e17_top)
+    data.table::fwrite(
+      hubs_e17_top[order(-hubs_e17_top$degree, -hubs_e17_top$betweenness), ],
+      file.path(OUTDIR, paste0("Male_E17.5_GO_network_top", MALE_E17_MAX_GENES_PER_TERM, "perTerm_hubs.csv"))
+    )
+  }
+
+  # Overlap network: keep only genes present in both timepoints' edges
+  overlap_genes <- intersect(unique(edges_e12$gene), unique(edges_e17$gene))
+  edges_overlap <- rbind(
+    transform(edges_e12, tp = labels[1]),
+    transform(edges_e17, tp = labels[2])
+  )
+  edges_overlap <- subset(edges_overlap, gene %in% overlap_genes)
+
+  g_overlap <- build_bipartite_graph(edges_overlap, deg_union)
+  out_png_ol <- file.path(OUTDIR, paste0(sex, "_Overlap_GO_network.png"))
+  plot_bipartite(g_overlap, paste0(sex, " immune-expanded GO–gene network (Overlap)"), out_png_ol)
+  hubs_ol <- graph_hubs_table(g_overlap)
+  data.table::fwrite(hubs_ol[order(-hubs_ol$degree, -hubs_ol$betweenness), ],
+                     file.path(OUTDIR, paste0(sex, "_Overlap_GO_network_hubs.csv")))
+}
+
+# ---------- 7) Session info ----------
+writeLines(c(capture.output(sessionInfo())), file.path(OUTDIR,"sessionInfo.txt"))
+message("\nDone. Files in: ", normalizePath(OUTDIR, winslash = "/", mustWork = FALSE))
